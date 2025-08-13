@@ -1,0 +1,9 @@
+[package]
+name = "srgan"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+burn = { version = "~0.18", features = ["std", "tui", "train", "vision", "wgpu", "ndarray", "fusion"], default-features = false }
+burn-wgpu = { version = "~0.18", features = ["vulkan"] }
+image = "0.25.6"
