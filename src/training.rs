@@ -1,19 +1,26 @@
 use burn::{
     config::Config,
     data::dataloader::DataLoader,
+    module::Module,
     nn::loss::{BinaryCrossEntropyLoss, BinaryCrossEntropyLossConfig, MseLoss, Reduction},
     optim::{AdamConfig, GradientsParams, Optimizer},
+    record::{FullPrecisionSettings, NamedMpkFileRecorder, Recorder},
     tensor::{
         backend::{AutodiffBackend, Backend},
         Int, Tensor,
     },
 };
 use image::RgbImage;
-use std::{error::Error, sync::Arc};
+use std::{error::Error, path::PathBuf, str::FromStr, sync::Arc, time::Instant};
 
 use crate::{
     data_srgan::SrganBatch,
-    model::{discriminator::Discriminator, generator::Generator, vgg19::Model as Vgg, ModelConfig},
+    model::{
+        discriminator::{Discriminator, DiscriminatorRecord},
+        generator::{Generator, GeneratorRecord},
+        vgg19::Model as Vgg,
+        ModelConfig,
+    },
     utils::{save_sample, tensor_to_image},
 };
 
@@ -43,7 +50,7 @@ fn calc_disc_loss<B: AutodiffBackend>(
     discriminator: &Discriminator<B>,
     bce: &BinaryCrossEntropyLoss<B>,
 ) -> DiscOutput<B> {
-    let fake_imgs = generator.forward(batch.lr_data.clone());
+    let fake_imgs = generator.forward(batch.lr_data.clone()).detach();
 
     let fake_out = discriminator.forward(fake_imgs);
     let fake_targets = Tensor::<B, 2, Int>::zeros([batch.size, 1], &fake_out.device());
@@ -107,8 +114,8 @@ fn calc_gen_loss<B: AutodiffBackend>(
     //     fake_imagenet_norm.clone().max().into_scalar()
     // );
 
-    let feature_space_fake_no_grads = vgg.extract_features(fake_imagenet_norm.inner());
-    let feature_space_real_no_grads = vgg.extract_features(real_imagenet_norm.inner());
+    let feature_space_fake_no_grads = vgg.extract_features(fake_imagenet_norm.inner()).detach();
+    let feature_space_real_no_grads = vgg.extract_features(real_imagenet_norm.inner()).detach();
     let feature_space_fake = Tensor::<B, 4>::from_inner(feature_space_fake_no_grads);
     let feature_space_real = Tensor::<B, 4>::from_inner(feature_space_real_no_grads);
 
@@ -172,11 +179,40 @@ pub fn train<B: AutodiffBackend>(
     config: TrainingConfig,
     dataloader_train: Arc<dyn DataLoader<B, SrganBatch<B>>>,
     dataloader_valid: Arc<dyn DataLoader<B, SrganBatch<B>>>,
+    recorder: NamedMpkFileRecorder<FullPrecisionSettings>,
     device: &B::Device,
+    should_continue: bool,
 ) -> Result<(), Box<dyn Error>> {
     let mut generator = config.model_config.generator_config.init::<B>(device);
     let mut discriminator = config.model_config.discriminator_config.init::<B>(device);
     let vgg = Vgg::default();
+
+    // Continue where you left off?
+    if should_continue {
+        let gen_path = PathBuf::from_str(format!("{}/generator.mpk", &config.outdir).as_str());
+        let disc_path = PathBuf::from_str(format!("{}/discriminator.mpk", &config.outdir).as_str());
+        println!("{:?}", gen_path);
+        println!("{:?}", disc_path);
+
+        match (gen_path, disc_path) {
+            (Ok(gen_path), Ok(disc_path)) if gen_path.exists() && disc_path.exists() => {
+                println!("Continuing from: {}", config.outdir);
+                let record = recorder
+                    .load::<GeneratorRecord<B>>(gen_path.into(), &device)
+                    .expect("Should be able to load generator model.");
+                generator = generator.clone().load_record(record);
+
+                let record = recorder
+                    .load::<DiscriminatorRecord<B>>(disc_path.into(), &device)
+                    .expect("Should be able to load generator model.");
+                discriminator = discriminator.clone().load_record(record);
+            }
+
+            _ => {
+                println!("Error loading saved model files. Starting new session...");
+            }
+        }
+    }
 
     let mut gen_optimizer = config.gen_optimizer.init();
     let mut disc_optimizer = config.disc_optimizer.init();
@@ -185,6 +221,40 @@ pub fn train<B: AutodiffBackend>(
     let mse = MseLoss::new();
 
     for epoch in 0..config.epochs {
+        // save sample
+        if epoch % config.sample_interval == 0 {
+            println!("saving sample");
+            match dataloader_valid.iter().next() {
+                Some(batch) => {
+                    let mut images: Vec<(RgbImage, RgbImage, RgbImage)> = vec![];
+                    for i in 0..3 {
+                        // get batch item
+                        let item = batch.from_index(i);
+
+                        // generate sr_data
+                        let lr_data: Tensor<B, 4> = item.lr_data.clone().unsqueeze();
+                        let sr_data: Tensor<B, 4> = generator.forward(lr_data).detach();
+                        let sr_data = sr_data.squeeze(0);
+
+                        // generate images
+                        images.push((
+                            tensor_to_image(item.lr_data),
+                            tensor_to_image(sr_data),
+                            tensor_to_image(item.hr_data),
+                        ));
+                    }
+                    let comp_image = save_sample(images, 128, 4);
+
+                    // save composite image
+                    let path = format!("{}/image-{epoch}.png", config.outdir);
+                    comp_image.save(path)?;
+                }
+
+                _ => println!("error getting validation batch!"),
+            }
+        }
+
+        let start = Instant::now();
         for (iteration, batch) in dataloader_train.iter().enumerate() {
             // train discriminator
             let disc_out = calc_disc_loss(&batch, &generator, &discriminator, &bce);
@@ -201,49 +271,57 @@ pub fn train<B: AutodiffBackend>(
 
             // print progress
             let batch_num = dataloader_train.num_items() / batch.size;
-            println!(
-                "[Epoch {:4}/{:4}] [Batch {:3}/{:3}] [D loss: {:+.5}] [G loss: {:+.5}]",
-                epoch + 1,
-                config.epochs,
-                iteration,
-                batch_num,
-                disc_out.loss.into_scalar(),
-                gen_out.loss.into_scalar()
-            );
-
-            // save sample
-            if epoch % config.sample_interval == 0 && iteration == (batch.size - 1) {
-                println!("saving sample");
-                match dataloader_valid.iter().next() {
-                    Some(batch) => {
-                        let mut images: Vec<(RgbImage, RgbImage, RgbImage)> = vec![];
-                        for i in 0..3 {
-                            // get batch item
-                            let item = batch.from_index(i);
-
-                            // generate sr_data
-                            let lr_data: Tensor<B, 4> = item.lr_data.clone().unsqueeze();
-                            let sr_data: Tensor<B, 4> = generator.forward(lr_data);
-                            let sr_data = sr_data.squeeze(0);
-
-                            // generate images
-                            images.push((
-                                tensor_to_image(item.lr_data),
-                                tensor_to_image(sr_data),
-                                tensor_to_image(item.hr_data),
-                            ));
-                        }
-                        let comp_image = save_sample(images, 128, 4);
-
-                        // save composite image
-                        let path = format!("{}/image-{epoch}.png", config.outdir);
-                        comp_image.save(path)?;
-                    }
-
-                    _ => println!("error getting validation batch!"),
-                }
+            if iteration % (batch_num / 10) == 0 {
+                println!(
+                    "[Epoch {:4}/{:4}] [Batch {:3}/{:3}] [D loss: {:+.5}] [G loss: {:+.5}]",
+                    epoch + 1,
+                    config.epochs,
+                    iteration,
+                    batch_num,
+                    disc_out.loss.into_scalar(),
+                    gen_out.loss.into_scalar()
+                );
             }
         }
+
+        let duration = start.elapsed();
+        println!("Epoch took: {:.6} seconds", duration.as_secs_f64());
+    }
+
+    // save model
+    generator
+        .clone()
+        .save_file(format!("{}/generator", config.outdir), &recorder)?;
+    discriminator.save_file(format!("{}/discriminator", config.outdir), &recorder)?;
+
+    println!("saving sample");
+    match dataloader_valid.iter().next() {
+        Some(batch) => {
+            let mut images: Vec<(RgbImage, RgbImage, RgbImage)> = vec![];
+            for i in 0..3 {
+                // get batch item
+                let item = batch.from_index(i);
+
+                // generate sr_data
+                let lr_data: Tensor<B, 4> = item.lr_data.clone().unsqueeze();
+                let sr_data: Tensor<B, 4> = generator.forward(lr_data).detach();
+                let sr_data = sr_data.squeeze(0);
+
+                // generate images
+                images.push((
+                    tensor_to_image(item.lr_data),
+                    tensor_to_image(sr_data),
+                    tensor_to_image(item.hr_data),
+                ));
+            }
+            let comp_image = save_sample(images, 128, 4);
+
+            // save composite image
+            let path = format!("{}/image-{}.png", config.outdir, config.epochs);
+            comp_image.save(path)?;
+        }
+
+        _ => println!("error getting validation batch!"),
     }
 
     Ok(())

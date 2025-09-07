@@ -27,6 +27,7 @@ impl<B: Backend> DiscBlock<B> {
         Self { conv, bn, lrelu }
     }
 
+    #[allow(unused)]
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let output = self.conv.forward(input);
         let output = self.bn.forward(output);
@@ -141,7 +142,10 @@ mod tests {
 
     #[test]
     fn test_pixel_shuffle_values() {
+        #[cfg(not(feature = "ndarray"))]
         let device = burn::backend::wgpu::WgpuDevice::default();
+        #[cfg(feature = "ndarray")]
+        let device = burn::backend::ndarray::NdArray::default();
 
         // Input: [1, 4, 3, 3] -> Output should be [1, 1, 4, 4]
         // We'll put different values in each channel to track them

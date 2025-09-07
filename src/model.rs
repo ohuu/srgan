@@ -22,6 +22,7 @@ pub struct ModelConfig {
     pub discriminator_config: DiscriminatorConfig,
 }
 impl ModelConfig {
+    #[allow(unused)]
     pub fn init<B: Backend>(&self, device: &B::Device) -> Model<B> {
         let generator = self.generator_config.init(device);
         let discriminator = self.discriminator_config.init(device);

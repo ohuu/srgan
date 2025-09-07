@@ -3,40 +3,20 @@ name = "srgan"
 version = "0.1.0"
 edition = "2024"
 
-[lib]
-crate-type = ["cdylib"]
-
 [[bin]]
 name = "srgan"
 path = "src/main.rs"
-required-features = ["training"]
 
 [features]
-default = ["inference"]
 build-vgg = []
-inference = ["burn/std", "burn/ndarray", "burn/fusion"]
-training = [
-  "burn/std",
-  "burn/train",
-  "burn/wgpu",
-  "burn/ndarray",
-  "burn/fusion",
-  "burn-wgpu",
-  "image",
-  "walkdir"
-]
+ndarray = []
 
 [dependencies]
-burn = { version = "~0.18", default-features = false }
-wasm-bindgen = "0.2"
-getrandom = { version = "0.3", features = ["wasm_js"] }
-serde = { version = "1.0", features = ["derive"] }
-serde-wasm-bindgen = "0.6"
-
-# Optional - training only deps
-burn-wgpu = { version = "~0.18", features = ["vulkan"], optional = true }
-image = { version = "0.25.6", optional = true }
-walkdir = { version = "2.4", optional = true }
+burn = { version = "~0.18", default-features = false, features = ["std", "fusion", "train", "ndarray", "wgpu"] }
+burn-wgpu = { version = "~0.18", features = ["vulkan"] }
+clap = { version = "4.5.47", features = ["derive"] }
+image = { version = "0.25.6" }
+walkdir = { version = "2.4" }
 
 [build-dependencies]
 burn-import = "~0.18"

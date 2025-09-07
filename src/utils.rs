@@ -2,6 +2,7 @@ use burn::prelude::*;
 use image::{imageops, Rgb, RgbImage};
 use std::{error::Error, path::Path};
 
+#[allow(unused)]
 pub fn load_image(path: &Path) -> Result<RgbImage, Box<dyn Error>> {
     let img = image::open(path)?;
     let rgb_img = img.to_rgb8();
@@ -61,6 +62,7 @@ pub fn tensor_to_image<B: Backend>(tensor: Tensor<B, 3>) -> RgbImage {
     img
 }
 
+#[allow(unused)]
 pub fn save_sample(
     images: Vec<(RgbImage, RgbImage, RgbImage)>,
     hr_image_size: u32,

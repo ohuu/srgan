@@ -55,7 +55,7 @@ impl<B: Backend> Default for Model<B> {
         let current_dir_str = current_dir
             .to_str()
             .expect("Failed to convert path to &str");
-        println!("Current directory: {:?}", current_dir);
+        println!("Loading VGG from: {:?}/models/vgg19", current_dir);
         Self::from_file(
             &format!("{}/models/vgg19", current_dir_str),
             &Default::default(),
@@ -249,7 +249,7 @@ impl<B: Backend> Model<B> {
         }
     }
 
-    #[allow(clippy::let_and_return, clippy::approx_constant)]
+    #[allow(clippy::let_and_return, clippy::approx_constant, unused)]
     pub fn forward(&self, input1: Tensor<B, 4>) -> Tensor<B, 2> {
         let conv2d1_out1 = self.conv2d1.forward(input1);
         let relu1_out1 = burn::tensor::activation::relu(conv2d1_out1);
@@ -310,6 +310,7 @@ impl<B: Backend> Model<B> {
         gemm3_out1
     }
 
+    #[allow(unused)]
     pub fn extract_features(&self, input1: Tensor<B, 4>) -> Tensor<B, 4> {
         let conv2d1_out1 = self.conv2d1.forward(input1);
         let relu1_out1 = burn::tensor::activation::relu(conv2d1_out1);

@@ -1,53 +1,56 @@
 mod model;
+mod utils;
 
-use crate::model::generator::{Generator, GeneratorConfig};
+#[cfg(feature = "ndarray")]
+use burn::backend::ndarray::NdArray;
+#[cfg(not(feature = "ndarray"))]
+use burn::backend::wgpu::Wgpu;
+
 use burn::{
-    backend::NdArray,
-    tensor::{Device, Tensor, TensorData},
+    module::Module,
+    record::{FullPrecisionSettings, NamedMpkFileRecorder, Recorder},
+    tensor::{Device, Tensor},
 };
-use wasm_bindgen::prelude::*;
+use image::RgbImage;
+use std::{error::Error, path::PathBuf, str::FromStr};
 
+use crate::{
+    model::generator::{Generator, GeneratorConfig, GeneratorRecord},
+    utils::{image_to_tensor, tensor_to_image},
+};
+
+#[cfg(feature = "ndarray")]
 type MyBackend = NdArray<f32>;
+#[cfg(not(feature = "ndarray"))]
+type MyBackend = Wgpu<f32>;
 
-#[wasm_bindgen]
 pub struct Model {
-    generator: Generator<MyBackend>,
-    device: Device<MyBackend>,
+    pub generator: Generator<MyBackend>,
+    pub device: Device<MyBackend>,
 }
 
-#[wasm_bindgen]
 impl Model {
-    #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
         let device = Default::default();
-        let generator = GeneratorConfig::new().init(&device);
+
+        // load model
+        let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
+        let path = PathBuf::from_str("/home/ohuu/Documents/srgan_out/generator").expect("");
+        let record: GeneratorRecord<MyBackend> = recorder
+            .load(path.into(), &device)
+            .expect("Should be able to load generator model.");
+
+        let generator = GeneratorConfig::new().init(&device).load_record(record);
 
         Self { generator, device }
     }
 
-    #[wasm_bindgen]
-    pub fn generate(
-        &self,
-        image: Vec<f32>,
-        width: usize,
-        height: usize,
-    ) -> Result<Vec<f32>, JsValue> {
-        let image_tensor = image.into_iter().map(|c| c as u8).collect::<Vec<_>>();
-        let image_tensor = Tensor::<MyBackend, 3>::from_data(
-            TensorData::new(image_tensor, [3, width, height]),
-            &self.device,
-        )
-        .unsqueeze();
+    pub fn generate(&self, image: RgbImage) -> Result<RgbImage, Box<dyn Error>> {
+        let image_tensor = image_to_tensor(image, &self.device).unsqueeze();
 
-        let sr_image: Tensor<MyBackend, 3> = self.generator.forward(image_tensor).squeeze(0);
-        let data = sr_image
-            .to_data()
-            .to_vec::<f32>()
-            .unwrap()
-            .iter()
-            .map(|c| (255.0 * ((c + 1.0) / 2.0)))
-            .collect::<Vec<_>>();
+        let sr_tensor: Tensor<MyBackend, 3> = self.generator.forward(image_tensor).squeeze(0);
+        let sr_image = tensor_to_image(sr_tensor);
 
-        Ok(data)
+        Ok(sr_image)
     }
 }

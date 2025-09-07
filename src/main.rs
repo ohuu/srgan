@@ -5,11 +5,17 @@ mod model;
 mod training;
 mod utils;
 
+#[cfg(feature = "ndarray")]
+use burn::backend::NdArray;
+#[cfg(not(feature = "ndarray"))]
+use burn::backend::Wgpu;
 use burn::{
-    backend::{Autodiff, NdArray, Wgpu},
+    backend::Autodiff,
     data::dataloader::DataLoaderBuilder,
     optim::AdamConfig,
+    record::{FullPrecisionSettings, NamedMpkFileRecorder},
 };
+use clap::Parser;
 use std::{error::Error, time::Instant};
 
 use crate::{
@@ -19,64 +25,106 @@ use crate::{
     utils::tensor_to_image,
 };
 
+#[cfg(not(feature = "ndarray"))]
 type MyBackend = Wgpu<f32>;
-// type MyBackend = NdArray<f32>;
+#[cfg(feature = "ndarray")]
+type MyBackend = NdArray<f32>;
 type MyAutodiffBackend = Autodiff<MyBackend>;
 
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Run performance test
+    #[arg(short, long, default_value_t = false)]
+    perf_test: bool,
+
+    /// Data directory
+    #[arg(short, long)]
+    data_dir: String,
+
+    #[arg(short, long)]
+    out_dir: String,
+
+    #[arg(short = 'c', long = "continue", default_value_t = true)]
+    should_continue: bool,
+
+    #[arg(short, long, default_value_t = 100)]
+    epochs: usize,
+
+    #[arg(short, long, default_value_t = 20)]
+    sample_interval: usize,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    #[cfg(not(feature = "ndarray"))]
     let device = burn::backend::wgpu::WgpuDevice::default();
-    // let device = burn::backend::ndarray::NdArrayDevice::default();
-    let datadir = "/home/ohuu/Downloads/DIV2K/hr128";
+    #[cfg(feature = "ndarray")]
+    let device = burn::backend::ndarray::NdArrayDevice::default();
+
+    let args = Args::parse();
+    let datadir = args.data_dir.as_str();
 
     // Create training data
-    // let datadir_train = format!("{}/training/scale_x4", datadir);
-    // let dataset_train = SrganDataset::<MyAutodiffBackend>::new(&datadir_train, &device)?;
-    // let dataloader_train = DataLoaderBuilder::new(SrganBatcher::new())
-    //     .batch_size(1)
-    //     .shuffle(42)
-    //     .num_workers(30)
-    //     .build(dataset_train);
+    println!("Training dataset: {}/training", datadir);
+    let datadir_train = format!("{}/training", datadir);
+    let dataset_train = SrganDataset::<MyAutodiffBackend>::new(&datadir_train, &device)?;
+    let dataloader_train = DataLoaderBuilder::new(SrganBatcher::new())
+        .batch_size(1)
+        .shuffle(std::time::Instant::now().elapsed().as_secs())
+        .num_workers(10)
+        .build(dataset_train);
 
     // Create validation data
-    let datadir_valid = format!("{}/validation/scale_x4", datadir);
+    println!("Validation dataset: {}/validation", datadir);
+    let datadir_valid = format!("{}/validation", datadir);
     let dataset_valid = SrganDataset::<MyAutodiffBackend>::new(&datadir_valid, &device)?;
     let dataloader_valid = DataLoaderBuilder::new(SrganBatcher::new())
-        .batch_size(1)
-        .shuffle(42)
-        .num_workers(10)
+        .batch_size(3)
+        .shuffle(std::time::Instant::now().elapsed().as_secs())
+        .num_workers(3)
         .build(dataset_valid);
 
     // Train
     let model_config = ModelConfig::new(GeneratorConfig::new(), DiscriminatorConfig::new(128));
     let gen_optimizer = AdamConfig::new();
     let disc_optimizer = AdamConfig::new();
-    let outdir = "/tmp/srgan".to_string();
-    let training_config = TrainingConfig::new(model_config, gen_optimizer, disc_optimizer, outdir)
-        .with_epochs(200)
-        .with_gen_lr(1e-5)
-        .with_disc_lr(1e-5)
-        .with_sample_interval(1);
+    let outdir = args.out_dir;
+    let training_config =
+        TrainingConfig::new(model_config, gen_optimizer, disc_optimizer, outdir.clone())
+            .with_epochs(args.epochs)
+            .with_gen_lr(1e-4)
+            .with_disc_lr(1e-4)
+            .with_sample_interval(args.sample_interval);
 
     // Infer the whole validation set
-    let start = Instant::now();
-    for (_, batch) in dataloader_valid.iter().enumerate() {
-        let generator = training_config
-            .model_config
-            .generator_config
-            .init::<MyBackend>(&device);
+    if args.perf_test {
+        let start = Instant::now();
+        for (_, batch) in dataloader_valid.iter().enumerate() {
+            for i in 0..batch.size {
+                let item = batch.from_index(i);
+                let generator = training_config
+                    .model_config
+                    .generator_config
+                    .init::<MyBackend>(&device);
 
-        let gen_image = generator.forward(batch.lr_data.inner());
-        tensor_to_image(gen_image.squeeze(0));
+                let gen_image = generator.forward(item.lr_data.unsqueeze().inner());
+                tensor_to_image(gen_image.squeeze(0));
+            }
+        }
+        let duration = start.elapsed();
+        println!("Loop took: {:.6} seconds", duration.as_secs_f64());
     }
-    let duration = start.elapsed();
-    println!("Loop took: {:.6} seconds", duration.as_secs_f64());
 
-    // train::<MyAutodiffBackend>(
-    //     training_config,
-    //     dataloader_train.clone(),
-    //     dataloader_valid.clone(),
-    //     &device,
-    // )?;
+    let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
+
+    train::<MyAutodiffBackend>(
+        training_config,
+        dataloader_train.clone(),
+        dataloader_valid.clone(),
+        recorder,
+        &device,
+        args.should_continue,
+    )?;
 
     Ok(())
 }
@@ -85,7 +133,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use crate::utils::tensor_to_image;
-    use burn::{data::dataset::Dataset, module::Module, tensor::s};
+    use burn::{data::dataset::Dataset, tensor::s};
 
     fn assert_vectors_close(actual: &[f32], expected: &[f32], tolerance: f32) {
         assert_eq!(
@@ -107,12 +155,14 @@ mod tests {
 
     #[test]
     pub fn can_load_image() -> Result<(), Box<dyn Error>> {
+        #[cfg(not(feature = "ndarray"))]
         let device = burn::backend::wgpu::WgpuDevice::default();
-        // let device = burn::backend::ndarray::NdArrayDevice::default();
-        let datadir: &str = "/home/ohuu/Downloads/DIV2K/test/hr128";
+        #[cfg(feature = "ndarray")]
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let datadir: &str = "/home/ohuu/srgan/DIV2K/test/hr128";
 
         // Create dataset
-        let datadir = format!("{}/training/scale_x4", datadir);
+        let datadir = format!("{}/training", datadir);
         let dataset = SrganDataset::<MyAutodiffBackend>::new(&datadir, &device)?;
 
         // Get first item in dataset
@@ -160,12 +210,14 @@ mod tests {
 
     #[test]
     pub fn can_save_image() -> Result<(), Box<dyn Error>> {
+        #[cfg(not(feature = "ndarray"))]
         let device = burn::backend::wgpu::WgpuDevice::default();
-        // let device = burn::backend::ndarray::NdArrayDevice::default();
-        let datadir: &str = "/home/ohuu/Downloads/DIV2K/test/hr128";
+        #[cfg(feature = "ndarray")]
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let datadir: &str = "/home/ohuu/srgan/DIV2K/test/hr128";
 
         // Create dataset
-        let datadir = format!("{}/training/scale_x4", datadir);
+        let datadir = format!("{}/training", datadir);
         let dataset = SrganDataset::<MyAutodiffBackend>::new(&datadir, &device)?;
 
         // Get first item in dataset
@@ -185,7 +237,7 @@ mod tests {
         }
 
         // Save image
-        lr_image.clone().save("/home/ohuu/test.png").unwrap();
+        lr_image.clone().save("/home/ohuu/srgan/test.png").unwrap();
 
         Ok(())
     }

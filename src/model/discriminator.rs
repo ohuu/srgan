@@ -25,6 +25,7 @@ pub struct Discriminator<B: Backend> {
     sig: Sigmoid,
 }
 impl<B: Backend> Discriminator<B> {
+    #[allow(unused)]
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 2> {
         let output = self.in_layer.forward(input);
         let output = self.lrelu.forward(output);
