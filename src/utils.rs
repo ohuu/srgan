@@ -63,7 +63,7 @@ pub fn tensor_to_image<B: Backend>(tensor: Tensor<B, 3>) -> RgbImage {
 }
 
 #[allow(unused)]
-pub fn save_sample(
+pub fn save_mosaic(
     images: Vec<(RgbImage, RgbImage, RgbImage)>,
     hr_image_size: u32,
     gap: u32,

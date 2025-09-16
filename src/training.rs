@@ -3,15 +3,22 @@ use burn::{
     data::dataloader::DataLoader,
     module::Module,
     nn::loss::{BinaryCrossEntropyLoss, BinaryCrossEntropyLossConfig, MseLoss, Reduction},
-    optim::{AdamConfig, GradientsParams, Optimizer},
+    optim::{adaptor::OptimizerAdaptor, Adam, AdamConfig, GradientsParams, Optimizer},
     record::{FullPrecisionSettings, NamedMpkFileRecorder, Recorder},
     tensor::{
         backend::{AutodiffBackend, Backend},
+        cast::ToElement,
         Int, Tensor,
     },
 };
 use image::RgbImage;
-use std::{error::Error, path::PathBuf, str::FromStr, sync::Arc, time::Instant};
+use std::{
+    error::Error,
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     data_srgan::SrganBatch,
@@ -21,7 +28,7 @@ use crate::{
         vgg19::Model as Vgg,
         ModelConfig,
     },
-    utils::{save_sample, tensor_to_image},
+    utils::{save_mosaic, tensor_to_image},
 };
 
 // ////////////////////////////////////////////////////////////////////////////
@@ -50,15 +57,15 @@ fn calc_disc_loss<B: AutodiffBackend>(
     discriminator: &Discriminator<B>,
     bce: &BinaryCrossEntropyLoss<B>,
 ) -> DiscOutput<B> {
-    let fake_imgs = generator.forward(batch.lr_data.clone()).detach();
+    let fake_imgs = generator.forward(batch.lr_data.clone());
 
     let fake_out = discriminator.forward(fake_imgs);
     let fake_targets = Tensor::<B, 2, Int>::zeros([batch.size, 1], &fake_out.device());
-    let fake_loss = bce.forward(fake_out.clone(), fake_targets.clone());
+    let fake_loss = bce.forward(fake_out, fake_targets);
 
     let real_out = discriminator.forward(batch.hr_data.clone());
     let real_targets = Tensor::<B, 2, Int>::ones([batch.size, 1], &real_out.device());
-    let real_loss = bce.forward(real_out.clone(), real_targets.clone());
+    let real_loss = bce.forward(real_out, real_targets);
 
     let loss = (fake_loss + real_loss) * 0.5;
 
@@ -69,89 +76,26 @@ fn calc_gen_loss<B: AutodiffBackend>(
     batch: &SrganBatch<B>,
     generator: &Generator<B>,
     discriminator: &Discriminator<B>,
-    vgg: &Vgg<B::InnerBackend>,
+    vgg: &Vgg<B>,
     adversarial_loss_weight: f32,
     bce: &BinaryCrossEntropyLoss<B>,
     mse: &MseLoss,
 ) -> GenOutput<B> {
     let generated_images = generator.forward(batch.lr_data.clone());
-    // DEBUG: Check generator output
-    // println!(
-    //     "Generated images - min: {:.6}, max: {:.6}, mean: {:.6}",
-    //     generated_images.clone().min().into_scalar(),
-    //     generated_images.clone().max().into_scalar(),
-    //     generated_images.clone().mean().into_scalar()
-    // );
 
     let adversarial_out = discriminator.forward(generated_images.clone());
     let adversarial_targets = Tensor::<B, 2, Int>::ones([batch.size, 1], &adversarial_out.device());
-    let adversarial_loss =
-        bce.forward(adversarial_out.clone(), adversarial_targets) * adversarial_loss_weight;
+    let adversarial_loss = bce.forward(adversarial_out, adversarial_targets);
 
-    // DEBUG: Adversarial out
-    // println!(
-    //     "Adversarial out - min: {:.6}, max: {:.6}, mean: {:.6}",
-    //     adversarial_out.clone().min().into_scalar(),
-    //     adversarial_out.clone().max().into_scalar(),
-    //     adversarial_out.clone().mean().into_scalar()
-    // );
-
-    let fake_imagenet_norm = imagenet_norm(generated_images.clone());
+    let fake_imagenet_norm = imagenet_norm(generated_images);
     let real_imagenet_norm = imagenet_norm(batch.hr_data.clone());
 
-    // DEBUG: Check normalized image ranges
-    // println!(
-    //     "Normalized fake - min: {:.6}, max: {:.6}, mean: {:.6}",
-    //     fake_imagenet_norm.clone().min().into_scalar(),
-    //     fake_imagenet_norm.clone().max().into_scalar(),
-    //     fake_imagenet_norm.clone().mean().into_scalar()
-    // );
-
-    // println!(
-    //     "Normalized real - min: {:.6}, max: {:.6}, mean: {:.6}",
-    //     real_imagenet_norm.clone().min().into_scalar(),
-    //     real_imagenet_norm.clone().max().into_scalar(),
-    //     fake_imagenet_norm.clone().max().into_scalar()
-    // );
-
-    let feature_space_fake_no_grads = vgg.extract_features(fake_imagenet_norm.inner()).detach();
-    let feature_space_real_no_grads = vgg.extract_features(real_imagenet_norm.inner()).detach();
-    let feature_space_fake = Tensor::<B, 4>::from_inner(feature_space_fake_no_grads);
-    let feature_space_real = Tensor::<B, 4>::from_inner(feature_space_real_no_grads);
-
-    // DEBUG: Check feature magnitudes
-    // println!(
-    //     "Fake features - min: {:.6}, max: {:.6}, mean: {:.6}",
-    //     feature_space_fake.clone().min().into_scalar(),
-    //     feature_space_fake.clone().max().into_scalar(),
-    //     feature_space_fake.clone().mean().into_scalar()
-    // );
-
-    // println!(
-    //     "Real features - min: {:.6}, max: {:.6}, mean: {:.6}",
-    //     feature_space_real.clone().min().into_scalar(),
-    //     feature_space_real.clone().max().into_scalar(),
-    //     feature_space_real.clone().mean().into_scalar()
-    // );
+    let feature_space_fake = vgg.extract_features(fake_imagenet_norm);
+    let feature_space_real = vgg.extract_features(real_imagenet_norm);
 
     let content_loss = mse.forward(feature_space_real, feature_space_fake, Reduction::Mean);
 
-    // DEBUG: Check loss components
-    // println!(
-    //     "Content loss - min: {:.6}, max: {:.6}, mean: {:.6}",
-    //     content_loss.clone().min().into_scalar(),
-    //     content_loss.clone().max().into_scalar(),
-    //     content_loss.clone().mean().into_scalar()
-    // );
-
-    // println!(
-    //     "Adversarial loss - min: {:.6}, max: {:.6}, mean: {:.6}",
-    //     adversarial_loss.clone().min().into_scalar(),
-    //     adversarial_loss.clone().max().into_scalar(),
-    //     adversarial_loss.clone().mean().into_scalar()
-    // );
-
-    let loss = content_loss + adversarial_loss.clone();
+    let loss = content_loss + (adversarial_loss * adversarial_loss_weight);
 
     GenOutput { loss }
 }
@@ -165,136 +109,19 @@ pub struct TrainingConfig {
     pub disc_optimizer: AdamConfig,
     pub outdir: String,
 
-    #[config(default = 1000)]
+    #[config(default = 10)]
     pub epochs: usize,
     #[config(default = 1e-4)]
     pub gen_lr: f64,
     #[config(default = 1e-4)]
     pub disc_lr: f64,
-    #[config(default = 5)]
-    pub sample_interval: usize,
 }
 
-pub fn train<B: AutodiffBackend>(
-    config: TrainingConfig,
-    dataloader_train: Arc<dyn DataLoader<B, SrganBatch<B>>>,
+pub fn save_sample<B: Backend>(
     dataloader_valid: Arc<dyn DataLoader<B, SrganBatch<B>>>,
-    recorder: NamedMpkFileRecorder<FullPrecisionSettings>,
-    device: &B::Device,
-    should_continue: bool,
+    generator: &Generator<B>,
+    outdir: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let mut generator = config.model_config.generator_config.init::<B>(device);
-    let mut discriminator = config.model_config.discriminator_config.init::<B>(device);
-    let vgg = Vgg::default();
-
-    // Continue where you left off?
-    if should_continue {
-        let gen_path = PathBuf::from_str(format!("{}/generator.mpk", &config.outdir).as_str());
-        let disc_path = PathBuf::from_str(format!("{}/discriminator.mpk", &config.outdir).as_str());
-        println!("{:?}", gen_path);
-        println!("{:?}", disc_path);
-
-        match (gen_path, disc_path) {
-            (Ok(gen_path), Ok(disc_path)) if gen_path.exists() && disc_path.exists() => {
-                println!("Continuing from: {}", config.outdir);
-                let record = recorder
-                    .load::<GeneratorRecord<B>>(gen_path.into(), &device)
-                    .expect("Should be able to load generator model.");
-                generator = generator.clone().load_record(record);
-
-                let record = recorder
-                    .load::<DiscriminatorRecord<B>>(disc_path.into(), &device)
-                    .expect("Should be able to load generator model.");
-                discriminator = discriminator.clone().load_record(record);
-            }
-
-            _ => {
-                println!("Error loading saved model files. Starting new session...");
-            }
-        }
-    }
-
-    let mut gen_optimizer = config.gen_optimizer.init();
-    let mut disc_optimizer = config.disc_optimizer.init();
-
-    let bce = BinaryCrossEntropyLossConfig::new().init::<B>(device);
-    let mse = MseLoss::new();
-
-    for epoch in 0..config.epochs {
-        // save sample
-        if epoch % config.sample_interval == 0 {
-            println!("saving sample");
-            match dataloader_valid.iter().next() {
-                Some(batch) => {
-                    let mut images: Vec<(RgbImage, RgbImage, RgbImage)> = vec![];
-                    for i in 0..3 {
-                        // get batch item
-                        let item = batch.from_index(i);
-
-                        // generate sr_data
-                        let lr_data: Tensor<B, 4> = item.lr_data.clone().unsqueeze();
-                        let sr_data: Tensor<B, 4> = generator.forward(lr_data).detach();
-                        let sr_data = sr_data.squeeze(0);
-
-                        // generate images
-                        images.push((
-                            tensor_to_image(item.lr_data),
-                            tensor_to_image(sr_data),
-                            tensor_to_image(item.hr_data),
-                        ));
-                    }
-                    let comp_image = save_sample(images, 128, 4);
-
-                    // save composite image
-                    let path = format!("{}/image-{epoch}.png", config.outdir);
-                    comp_image.save(path)?;
-                }
-
-                _ => println!("error getting validation batch!"),
-            }
-        }
-
-        let start = Instant::now();
-        for (iteration, batch) in dataloader_train.iter().enumerate() {
-            // train discriminator
-            let disc_out = calc_disc_loss(&batch, &generator, &discriminator, &bce);
-            let grads = disc_out.loss.backward();
-            let grads = GradientsParams::from_grads(grads, &discriminator);
-            discriminator = disc_optimizer.step(config.disc_lr, discriminator, grads);
-
-            // train generator
-            let gen_out =
-                calc_gen_loss(&batch, &generator, &discriminator, &vgg, 0.001, &bce, &mse);
-            let grads = gen_out.loss.backward();
-            let grads = GradientsParams::from_grads(grads, &generator);
-            generator = gen_optimizer.step(config.gen_lr, generator, grads);
-
-            // print progress
-            let batch_num = dataloader_train.num_items() / batch.size;
-            if iteration % (batch_num / 10) == 0 {
-                println!(
-                    "[Epoch {:4}/{:4}] [Batch {:3}/{:3}] [D loss: {:+.5}] [G loss: {:+.5}]",
-                    epoch + 1,
-                    config.epochs,
-                    iteration,
-                    batch_num,
-                    disc_out.loss.into_scalar(),
-                    gen_out.loss.into_scalar()
-                );
-            }
-        }
-
-        let duration = start.elapsed();
-        println!("Epoch took: {:.6} seconds", duration.as_secs_f64());
-    }
-
-    // save model
-    generator
-        .clone()
-        .save_file(format!("{}/generator", config.outdir), &recorder)?;
-    discriminator.save_file(format!("{}/discriminator", config.outdir), &recorder)?;
-
-    println!("saving sample");
     match dataloader_valid.iter().next() {
         Some(batch) => {
             let mut images: Vec<(RgbImage, RgbImage, RgbImage)> = vec![];
@@ -314,15 +141,117 @@ pub fn train<B: AutodiffBackend>(
                     tensor_to_image(item.hr_data),
                 ));
             }
-            let comp_image = save_sample(images, 128, 4);
+            let comp_image = save_mosaic(images, 128, 4);
 
             // save composite image
-            let path = format!("{}/image-{}.png", config.outdir, config.epochs);
+            let time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            let path = format!("{}/{}.png", outdir, time);
             comp_image.save(path)?;
         }
 
         _ => println!("error getting validation batch!"),
     }
+
+    Ok(())
+}
+
+pub fn train<B: AutodiffBackend>(
+    config: TrainingConfig,
+    dataloader_train: Arc<dyn DataLoader<B, SrganBatch<B>>>,
+    dataloader_valid: Arc<dyn DataLoader<B, SrganBatch<B>>>,
+    recorder: NamedMpkFileRecorder<FullPrecisionSettings>,
+    device: &B::Device,
+    should_continue: bool,
+) -> Result<(), Box<dyn Error>> {
+    let mut generator = config.model_config.generator_config.init::<B>(device);
+    let mut discriminator = config.model_config.discriminator_config.init::<B>(device);
+    let vgg = Vgg::default();
+
+    let mut gen_optimizer = config.gen_optimizer.init();
+    let mut disc_optimizer = config.disc_optimizer.init();
+
+    // Continue where you left off?
+    if should_continue {
+        let gen_path = PathBuf::from_str(format!("{}/gen.mpk", &config.outdir).as_str());
+        let disc_path = PathBuf::from_str(format!("{}/disc.mpk", &config.outdir).as_str());
+
+        match (gen_path, disc_path) {
+            (Ok(gen_path), Ok(disc_path)) if gen_path.exists() && disc_path.exists() => {
+                println!("Continuing from previous run");
+
+                let record = recorder
+                    .load::<DiscriminatorRecord<B>>(disc_path.into(), &device)
+                    .expect("Should be able to load discriminator model.");
+                discriminator = discriminator.load_record(record);
+                let record = recorder
+                    .load::<GeneratorRecord<B>>(gen_path.into(), &device)
+                    .expect("Should be able to load generator model.");
+                generator = generator.load_record(record);
+            }
+
+            _ => {
+                println!("Unable to load saved model files. Starting new session...");
+            }
+        }
+    }
+
+    let bce = BinaryCrossEntropyLossConfig::new().init::<B>(device);
+    let mse = MseLoss::new();
+
+    let mut d_loss = 0.0;
+    let mut g_loss = 0.0;
+    for epoch in 0..config.epochs {
+        for (it, batch) in dataloader_train.iter().enumerate() {
+            let batch_num = dataloader_train.num_items() / batch.size;
+
+            let disc_out = calc_disc_loss(&batch, &generator, &discriminator, &bce);
+            let disc_loss = disc_out.loss.clone().into_scalar().to_f32();
+            let grads = disc_out.loss.backward();
+            let grads = GradientsParams::from_grads(grads, &discriminator);
+            discriminator = disc_optimizer.step(config.disc_lr, discriminator, grads);
+            d_loss += disc_loss;
+
+            // train generator
+            let gen_out =
+                calc_gen_loss(&batch, &generator, &discriminator, &vgg, 0.001, &bce, &mse);
+            let gen_loss = gen_out.loss.clone().into_scalar().to_f32();
+            let grads = gen_out.loss.backward();
+            let grads = GradientsParams::from_grads(grads, &generator);
+            generator = gen_optimizer.step(config.gen_lr, generator, grads);
+            g_loss += gen_loss;
+
+            // print progress
+            if it > 0 && it % (batch_num / 10) == 0 {
+                println!(
+                    "[Epoch: {:2}/{:2}, Batch: {:4}/{:4}][D loss: {:+.5}, G loss: {:+.5}]",
+                    epoch,
+                    config.epochs,
+                    it * batch.size,
+                    batch_num,
+                    d_loss / (it as f32),
+                    g_loss / (it as f32)
+                );
+
+                // save sample
+                save_sample(dataloader_valid.clone(), &generator, &config.outdir)?;
+            }
+        }
+        d_loss = 0.0;
+        g_loss = 0.0;
+    }
+
+    // save sample
+    save_sample(dataloader_valid.clone(), &generator, &config.outdir)?;
+
+    // save model
+    recorder.record(
+        discriminator.into_record(),
+        format!("{}/disc", config.outdir).into(),
+    )?;
+    recorder.record(
+        generator.into_record(),
+        format!("{}/gen", config.outdir).into(),
+    )?;
 
     Ok(())
 }

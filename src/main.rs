@@ -2,6 +2,7 @@
 
 mod data_srgan;
 mod model;
+#[allow(unused)]
 mod training;
 mod utils;
 
@@ -16,7 +17,10 @@ use burn::{
     record::{FullPrecisionSettings, NamedMpkFileRecorder},
 };
 use clap::Parser;
-use std::{error::Error, time::Instant};
+use std::{
+    error::Error,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     data_srgan::{SrganBatcher, SrganDataset},
@@ -48,11 +52,17 @@ struct Args {
     #[arg(short = 'c', long = "continue", default_value_t = true)]
     should_continue: bool,
 
-    #[arg(short, long, default_value_t = 100)]
-    epochs: usize,
+    #[arg(short, long, default_value_t = 1)]
+    batch_size: usize,
 
-    #[arg(short, long, default_value_t = 20)]
-    sample_interval: usize,
+    #[arg(long, default_value_t = 1e-4)]
+    gen_lr: f64,
+
+    #[arg(long, default_value_t = 1e-4)]
+    disc_lr: f64,
+
+    #[arg(short, long, default_value_t = 10)]
+    epochs: usize,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -66,11 +76,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Create training data
     println!("Training dataset: {}/training", datadir);
+    let time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let datadir_train = format!("{}/training", datadir);
     let dataset_train = SrganDataset::<MyAutodiffBackend>::new(&datadir_train, &device)?;
     let dataloader_train = DataLoaderBuilder::new(SrganBatcher::new())
-        .batch_size(1)
-        .shuffle(std::time::Instant::now().elapsed().as_secs())
+        .batch_size(args.batch_size)
+        .shuffle(time)
         .num_workers(10)
         .build(dataset_train);
 
@@ -80,7 +91,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let dataset_valid = SrganDataset::<MyAutodiffBackend>::new(&datadir_valid, &device)?;
     let dataloader_valid = DataLoaderBuilder::new(SrganBatcher::new())
         .batch_size(3)
-        .shuffle(std::time::Instant::now().elapsed().as_secs())
+        .shuffle(time)
         .num_workers(3)
         .build(dataset_valid);
 
@@ -92,9 +103,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let training_config =
         TrainingConfig::new(model_config, gen_optimizer, disc_optimizer, outdir.clone())
             .with_epochs(args.epochs)
-            .with_gen_lr(1e-4)
-            .with_disc_lr(1e-4)
-            .with_sample_interval(args.sample_interval);
+            .with_gen_lr(args.gen_lr)
+            .with_disc_lr(args.disc_lr);
 
     // Infer the whole validation set
     if args.perf_test {
